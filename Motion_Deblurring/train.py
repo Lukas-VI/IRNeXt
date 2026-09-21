@@ -1,3 +1,11 @@
+"""
+train.py：运动去模糊任务（GoPro 数据集）的训练主循环。
+物理上与去雾任务的 ITS train.py 相同：
+  - 优化器 adam；warmup(3 个 epoch) + 余弦退火串联。
+  - 损失 = 三尺度 L1 内容损失 + 0.1 * 三尺度 FFT 频域损失。
+  - 周期性在 GoPro 验证集上测 PSNR，保存 best / Final 模型。
+区别仅在于：峰值 num_epoch 非常大（默认 3000），以及验证函数里变量名用 gopro。
+"""
 import os
 import torch
 from data import train_dataloader
@@ -15,12 +23,12 @@ def _train(model, args):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8)
     dataloader = train_dataloader(args.data_dir, args.batch_size, args.num_worker)
     max_iter = len(dataloader)
-    warmup_epochs=3
+    warmup_epochs=3                        # 前 3 个 epoch 热身
     scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epoch-warmup_epochs, eta_min=1e-6)
     scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=warmup_epochs, after_scheduler=scheduler_cosine)
     scheduler.step()
     epoch = 1
-    if args.resume:
+    if args.resume:                        # 断点续训
         state = torch.load(args.resume)
         epoch = state['epoch']
         optimizer.load_state_dict(state['optimizer'])
@@ -43,19 +51,20 @@ def _train(model, args):
         iter_timer.tic()
         for iter_idx, batch_data in enumerate(dataloader):
 
-            input_img, label_img = batch_data
+            input_img, label_img = batch_data   # 模糊图 / 清晰图
             input_img = input_img.to(device)
             label_img = label_img.to(device)
 
             optimizer.zero_grad()
-            pred_img = model(input_img)
+            pred_img = model(input_img)         # 三尺度预测
             label_img2 = F.interpolate(label_img, scale_factor=0.5, mode='bilinear')
             label_img4 = F.interpolate(label_img, scale_factor=0.25, mode='bilinear')
-            l1 = criterion(pred_img[0], label_img4)
-            l2 = criterion(pred_img[1], label_img2)
-            l3 = criterion(pred_img[2], label_img)
+            l1 = criterion(pred_img[0], label_img4)   # 1/4 尺度
+            l2 = criterion(pred_img[1], label_img2)   # 1/2 尺度
+            l3 = criterion(pred_img[2], label_img)    # 全尺度
             loss_content = l1+l2+l3
 
+            # ---- 三尺度 FFT 频域损失 ----
             label_fft1 = torch.fft.fft2(label_img4, dim=(-2,-1))
             label_fft1 = torch.stack((label_fft1.real, label_fft1.imag), -1)
 
@@ -81,7 +90,7 @@ def _train(model, args):
 
             loss = loss_content + 0.1 * loss_fft
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.001)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.001)   # 梯度裁剪
             optimizer.step()
 
             iter_pixel_adder(loss_content.item())
@@ -90,7 +99,7 @@ def _train(model, args):
             epoch_pixel_adder(loss_content.item())
             epoch_fft_adder(loss_fft.item())
 
-            if (iter_idx + 1) % args.print_freq == 0:
+            if (iter_idx + 1) % args.print_freq == 0:   # 周期打印
                 print("Time: %7.4f Epoch: %03d Iter: %4d/%4d LR: %.10f Loss content: %7.4f Loss fft: %7.4f" % (
                     iter_timer.toc(), epoch_idx, iter_idx + 1, max_iter, scheduler.get_lr()[0], iter_pixel_adder.average(),
                     iter_fft_adder.average()))
@@ -99,26 +108,27 @@ def _train(model, args):
                 iter_timer.tic()
                 iter_pixel_adder.reset()
                 iter_fft_adder.reset()
+        # 每 epoch 覆盖保存当前模型(含优化器/epoch)
         overwrite_name = os.path.join(args.model_save_dir, 'model.pkl')
         torch.save({'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'epoch': epoch_idx}, overwrite_name)
 
-        if epoch_idx % args.save_freq == 0:
+        if epoch_idx % args.save_freq == 0:    # 周期存档快照
             save_name = os.path.join(args.model_save_dir, 'model_%d.pkl' % epoch_idx)
             torch.save({'model': model.state_dict()}, save_name)
         print("EPOCH: %02d\nElapsed time: %4.2f Epoch Pixel Loss: %7.4f Epoch FFT Loss: %7.4f" % (
             epoch_idx, epoch_timer.toc(), epoch_pixel_adder.average(), epoch_fft_adder.average()))
         epoch_fft_adder.reset()
         epoch_pixel_adder.reset()
-        scheduler.step()
+        scheduler.step()                       # 学习率步进
 
-        if epoch_idx % args.valid_freq == 0:
+        if epoch_idx % args.valid_freq == 0:   # 周期性在 GoPro 验证集测 PSNR
             val_gopro = _valid(model, args, epoch_idx)
             print('%03d epoch \n Average GOPRO PSNR %.2f dB' % (epoch_idx, val_gopro))
             writer.add_scalar('PSNR_GOPRO', val_gopro, epoch_idx)
             if val_gopro >= best_psnr:
                 torch.save({'model': model.state_dict()}, os.path.join(args.model_save_dir, 'Best.pkl'))
                 
-    save_name = os.path.join(args.model_save_dir, 'Final.pkl')
+    save_name = os.path.join(args.model_save_dir, 'Final.pkl')  # 训练结束保存最终模型
     torch.save({'model': model.state_dict()}, save_name)
